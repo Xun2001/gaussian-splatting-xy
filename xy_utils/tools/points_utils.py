@@ -56,3 +56,28 @@ def voxel_downsample_and_save(voxel_size, input_ply_path, output_ply_path):
     # 保存降采样后的点云
     o3d.io.write_point_cloud(output_ply_path, pcd_downsampled)
     print(f"降采样后的点云已保存到 {output_ply_path}，体素大小：{voxel_size}")
+
+def load_pcd(pcd_file_path):
+    pcd = o3d.io.read_point_cloud(pcd_file_path)
+    xyz = np.asarray(pcd.points)
+    rgb = np.asarray(pcd.colors)
+    if np.max(rgb) <= 1.0:
+        rgb = (rgb * 255).astype(np.uint8)
+    return xyz, rgb
+
+def load_ply(ply_file_path):
+    pcd = o3d.io.read_point_cloud(ply_file_path)
+    xyz = np.asarray(pcd.points)
+    rgb = np.asarray(pcd.colors)
+    if np.max(rgb) <= 1.0:
+        rgb = (rgb * 255).astype(np.uint8)
+    return xyz, rgb
+
+def save_ply(xyz, colors, file_path):
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    o3d.io.write_point_cloud(file_path, pcd)
+    
+    print(f"保存点云到 {file_path}")

@@ -21,6 +21,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from scene.xy_utils import storePly
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -64,6 +65,9 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        
+        self.skybox_points = 0
+        self.skybox_locked = True
 
     def capture(self):
         return (
@@ -146,34 +150,137 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
+    def create_from_pcd(self, 
+                        pcd : BasicPointCloud, 
+                        cam_infos : int, 
+                        spatial_lr_scale : float,
+                        addition_points: int,
+                        scaffold_file: str,
+                        bounds_file: str,
+                        skybox_locked: bool):
+        
+        # if addition_points > 0:
+        #     self.skybox_points = addition_points # 原主代码中控制 skybox_points 更新的逻辑
+        #     groundbox_points = addition_points // 2
+        #     skybox_points = addition_points - groundbox_points
+        
+        self.skybox_points = addition_points
+        skybox_points = addition_points
+        self.skybox_locked = skybox_locked
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        
+        xyz_np = np.asarray(pcd.points)
+        xyz = torch.tensor(xyz_np).float().cuda() # [N,3] use xyz replace fused_point_cloud
+        fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda() # [N,3] from 0 to 1
+        
+        # segment ground plane
+        from utils.points_utils import fit_ground_plane
+        plane_model, inliers = fit_ground_plane(xyz_np, threshold=0.001)
+        inliers = np.array(inliers)
+        ground_points = xyz_np[inliers]
+        ground_center = ground_points.mean(axis=0)
+        ground_radius = np.linalg.norm(ground_points - ground_center, axis=1).max() # need-check
+        
+        if scaffold_file != "" and skybox_points > 0: # TODO: load scaffold_file
+            print(f"Overriding skybox_points: loading skybox from scaffold_file: {scaffold_file}")
+            skybox_points = 0
+        
+        if skybox_points > 0:
+            radius = ground_radius
+            mean = torch.tensor(ground_center).float().cuda()
+            theta = (2.0 * torch.pi * torch.rand(skybox_points, device="cuda")).float() # torch.rand generate [0,1)
+            phi = (torch.arccos(1.0 - 1.4 * torch.rand(skybox_points, device="cuda"))).float() # arc cos [-0.4,1] --> 角度 [0,110]
+            skybox_xyz = torch.zeros((skybox_points, 3))
+            skybox_xyz[:, 0] = radius * 5 * torch.cos(theta)*torch.sin(phi) # 5 * radius
+            skybox_xyz[:, 1] = radius * 5 * torch.sin(theta)*torch.sin(phi)
+            skybox_xyz[:, 2] = radius * 5 * torch.cos(phi)
+            
+            normal = torch.tensor(plane_model[:3], dtype=torch.float32)
+            up = torch.tensor([0.0, 0.0, 1.0])
+            
+            from utils.points_utils import create_rotation_matrix
+            R = create_rotation_matrix(up, normal)
+            R = torch.from_numpy(R).float()
+            skybox_xyz = (R@skybox_xyz.T).T
+            
+            skybox_xyz += mean.cpu() # put points in the center of the scene
+            xyz = torch.concat((skybox_xyz.cuda(), xyz))
+            fused_color = torch.concat((torch.ones((skybox_points, 3)).cuda(), fused_color))
+            fused_color[:skybox_points,0] *= 0.7
+            fused_color[:skybox_points,1] *= 0.8
+            fused_color[:skybox_points,2] *= 0.95
+
+        groundbox_points = 0
+        if groundbox_points > 0:
+            radius = ground_radius
+            mean = torch.tensor(ground_center).float().cuda()
+            
+            a, b, c, d = plane_model
+            theta = 2.0 * torch.pi * torch.rand(groundbox_points, device="cuda")  # 角度 [0, 2pi)
+            r = radius * torch.sqrt(torch.rand(groundbox_points, device="cuda"))  # 半径范围 [0, 2*radius]
+            
+            groundbox_xyz = torch.zeros((groundbox_points, 3))
+            groundbox_xyz[:, 0] = r * torch.cos(theta)
+            groundbox_xyz[:, 1] = r * torch.sin(theta)
+            groundbox_xyz[:, 2] = (-a * groundbox_xyz[:, 0] - b * groundbox_xyz[:, 1] - d) / c
+            groundbox_xyz += mean.cpu()
+            groundbox_color = torch.ones((groundbox_points, 3), device="cuda") * torch.tensor([0.5, 0.5, 0.5], device="cuda")
+            
+            xyz = torch.concat((groundbox_xyz.cuda(), xyz), dim=0)
+            fused_color = torch.concat((groundbox_color.cuda(), fused_color), dim=0)
+            
+            debug_xy = True
+            if debug_xy:
+                folder = "/home/qinllgroup/hongxiangyu/git_project/gaussian-splatting-xy/data/tree_01_debug/mini3/outputs_debug"
+                sky_ply_path = os.path.join(folder, "skybox_scene_init.ply")
+                storePly(sky_ply_path, xyz.cpu(), fused_color.cpu()*255)
+                print("save sky and groud init ply in: ", sky_ply_path)
+        
+        
+        # fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        
+        # fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
+        features[:, :3, 0 ] = RGB2SH(fused_color)
         features[:, 3:, 1:] = 0.0
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        # dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(xyz), 0.0000001) # shape [],to caculate the 
+        if scaffold_file == "" and skybox_points > 0:
+            dist2[:skybox_points] *= 10 # sky points * 10 扩大每个高斯最近
+            dist2[skybox_points:] = torch.clamp_max(dist2[skybox_points:], 10) # 使得场景内高斯点的距离小于10
+        
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros((xyz.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        # opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        if scaffold_file == "" and skybox_points > 0:
+            opacities = self.inverse_opacity_activation(0.02 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda"))
+            opacities[:skybox_points] = 0.7  # sky 0.02 other 0.7
+        else:
+            opacities = self.inverse_opacity_activation(0.01 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda"))
+        
+        features_dc = features[:,:,0:1].transpose(1, 2).contiguous()
+        features_rest = features[:,:,1:].transpose(1, 2).contiguous()
+        self.scaffold_points = None
+        if scaffold_file != "":
+            print("TODO:load scaffold_file")
+        
+        self._xyz = nn.Parameter(xyz.requires_grad_(True))
+        self._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+        self._features_rest = nn.Parameter(features_rest.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
+        
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
+        print("Number of points at initialisation : ", self._xyz.shape[0])
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense

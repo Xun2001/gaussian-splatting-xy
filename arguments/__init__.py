@@ -40,8 +40,8 @@ class ParamGroup:
     def extract(self, args):
         group = GroupParams()
         for arg in vars(args).items():
-            if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
-                setattr(group, arg[0], arg[1])
+            if arg[0] in vars(self) or ("_" + arg[0]) in vars(self): # 将args中的参数进行分流，分给不同的Params；所以Param初始化中没有的不能额外加入
+                setattr(group, arg[0], arg[1]) # 内置函数，将属性 arg[0] 和对应的值 arg[1] 赋给group
         return group
 
 class ModelParams(ParamGroup): 
@@ -56,7 +56,11 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
-        super().__init__(parser, "Loading Parameters", sentinel)
+        self.skybox_locked = False
+        self.skybox_num = 0
+        self.scaffold_file = ""
+        self.bounds_file = ""
+        super().__init__(parser, "Loading Parameters", sentinel) # add parameters into parser
 
     def extract(self, args):
         g = super().extract(args)
